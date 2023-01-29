@@ -1,6 +1,10 @@
 // at the top of main.rs - that will prevent the console from showing
 #![windows_subsystem = "windows"]
 extern crate image;
+
+use serde::{Deserialize, Serialize};
+use std::fs::{create_dir_all, File};
+use std::io::Write;
 use tauri_utils::config::{Config, WindowConfig};
 use wry::{
     application::{
@@ -10,6 +14,7 @@ use wry::{
         window::{Fullscreen, Window, WindowBuilder},
     },
     webview::WebViewBuilder,
+    Error,
 };
 
 #[cfg(target_os = "macos")]
@@ -28,10 +33,28 @@ use wry::webview::WebContext;
 
 use dirs::download_dir;
 use std::path::PathBuf;
+use wry::application::dpi::{
+    LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size,
+};
+use wry::application::monitor::MonitorHandle;
 
 enum UserEvent {
     DownloadStarted(String, String),
     DownloadComplete(Option<PathBuf>, bool),
+}
+
+pub const STATE_FILENAME: &str = ".window-state";
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+struct WindowState {
+    width: f64,
+    height: f64,
+    x: i32,
+    y: i32,
+    maximized: bool,
+    visible: bool,
+    decorated: bool,
+    fullscreen: bool,
 }
 
 fn main() -> wry::Result<()> {
@@ -59,7 +82,6 @@ fn main() -> wry::Result<()> {
         (menu_bar_menu, close_item)
     };
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
     let (
         package_name,
         WindowConfig {
@@ -68,6 +90,7 @@ fn main() -> wry::Result<()> {
             height,
             resizable,
             fullscreen,
+            transparent,
             ..
         },
     ) = {
@@ -80,32 +103,33 @@ fn main() -> wry::Result<()> {
         )
     };
 
-    #[cfg(target_os = "macos")]
-    let WindowConfig {
-        url,
-        width,
-        height,
-        resizable,
-        transparent,
-        fullscreen,
-        ..
-    } = get_windows_config().1.unwrap_or_default();
+    let app_dir = dirs::config_dir().unwrap().join(&package_name);
+    let state_path = app_dir.join(STATE_FILENAME);
+
+    let window_state = if state_path.exists() {
+        let file = File::open(&state_path)?;
+        let state: WindowState = serde_json::from_reader(file)?;
+        Some(state)
+    } else {
+        None
+    };
 
     let event_loop: EventLoop<UserEvent> = EventLoop::with_user_event();
     let proxy = event_loop.create_proxy();
     let common_window = WindowBuilder::new()
         .with_title("")
         .with_resizable(resizable)
-        .with_fullscreen(if fullscreen {
-            Some(Fullscreen::Borderless(None))
-        } else {
-            None
+        .with_maximized(match window_state {
+            Some(state) => state.maximized,
+            None => false,
         })
-        .with_inner_size(wry::application::dpi::LogicalSize::new(width, height));
-
+        .with_position(match window_state {
+            Some(state) => Position::Physical(PhysicalPosition::new(state.x, state.y)),
+            None => Position::Logical(LogicalPosition::default()),
+        });
     #[cfg(target_os = "windows")]
     let window = {
-        let mut icon_path = format!("png/{}_32.ico", package_name);
+        let mut icon_path = format!("png/{}_32.ico", &package_name);
         // If there is no setting, use the default one.
         if !std::path::Path::new(&icon_path).exists() {
             icon_path = "png/icon_32.ico".to_string();
@@ -130,6 +154,26 @@ fn main() -> wry::Result<()> {
         .with_menu(menu_bar_menu)
         .build(&event_loop)
         .unwrap();
+
+    match window_state {
+        Some(state) => {
+            if state.fullscreen {
+                window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
+            } else {
+                window.set_fullscreen(None);
+            }
+
+            window.set_inner_size(Size::Logical(LogicalSize::new(state.width, state.height)))
+        }
+        None => {
+            if fullscreen {
+                window.set_fullscreen(Some(Fullscreen::Borderless(window.current_monitor())));
+            } else {
+                window.set_fullscreen(None);
+            }
+            window.set_inner_size(Size::Logical(LogicalSize::new(width, height)))
+        }
+    }
 
     // Handling events of JS -> Rust
     let handler = move |window: &Window, req: String| {
@@ -188,9 +232,9 @@ fn main() -> wry::Result<()> {
             None => panic!("Error, can't found you home dir!!"),
         };
         #[cfg(target_os = "windows")]
-        let data_dir = home_dir.join("AppData").join("Roaming").join(package_name);
+        let data_dir = home_dir.join("AppData").join("Roaming").join(&package_name);
         #[cfg(target_os = "linux")]
-        let data_dir = home_dir.join(".config").join(package_name);
+        let data_dir = home_dir.join(".config").join(&package_name);
         if !data_dir.exists() {
             std::fs::create_dir(&data_dir)
                 .unwrap_or_else(|_| panic!("can't create dir {}", data_dir.display()));
@@ -224,7 +268,51 @@ fn main() -> wry::Result<()> {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
+            } => {
+                if app_dir.exists() {
+                    let mut state = WindowState::default();
+
+                    let window = webview.window();
+                    let is_maximized = window.is_maximized();
+                    state.maximized = is_maximized;
+                    state.fullscreen = window.fullscreen().is_some();
+                    state.decorated = window.is_decorated();
+                    state.visible = window.is_visible();
+
+                    let scale_factor = window
+                        .current_monitor()
+                        .map(|m| m.scale_factor())
+                        .unwrap_or(1.);
+
+                    let size = webview.inner_size().to_logical(scale_factor);
+                    // It doesn't make sense to save a self with 0 height or width
+                    if size.width > 0. && size.height > 0. && !is_maximized {
+                        state.width = size.width;
+                        state.height = size.height;
+                    }
+
+                    let position = window.inner_position().unwrap();
+
+                    if let Some(monitor) = window.current_monitor() {
+                        // save only window positions that are inside the current monitor
+                        if monitor.contains(position) && !is_maximized {
+                            state.x = position.x;
+                            state.y = position.y;
+                        }
+                    }
+
+                    create_dir_all(&app_dir)
+                        .map_err(Error::Io)
+                        .and_then(|_| File::create(&state_path).map_err(Into::into))
+                        .and_then(|mut f| {
+                            f.write_all(serde_json::to_string(&state).unwrap().as_ref())
+                                .map_err(Into::into)
+                        })
+                        .expect("Can't save window state");
+                };
+
+                *control_flow = ControlFlow::Exit
+            }
             Event::MenuEvent {
                 menu_id,
                 origin: MenuType::MenuBar,
@@ -274,4 +362,20 @@ fn load_icon(path: &std::path::Path) -> Icon {
         (rgba, width, height)
     };
     Icon::from_rgba(icon_rgba, icon_width, icon_height).expect("Failed to open icon")
+}
+
+trait MonitorExt {
+    fn contains(&self, position: PhysicalPosition<i32>) -> bool;
+}
+
+impl MonitorExt for MonitorHandle {
+    fn contains(&self, position: PhysicalPosition<i32>) -> bool {
+        let PhysicalPosition { x, y } = self.position();
+        let PhysicalSize { width, height } = self.size();
+
+        x < position.x as _
+            && position.x < (x + width as i32)
+            && y < position.y as _
+            && position.y < (y + height as i32)
+    }
 }
