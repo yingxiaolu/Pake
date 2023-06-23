@@ -183,3 +183,4 @@ done
 
 echo "build all package success!"
 echo "you run 'rm src-tauri/assets/*.desktop && git checkout src-tauri' to recovery code"
+read -p "Press any key to continue..."

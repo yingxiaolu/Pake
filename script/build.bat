@@ -97,3 +97,7 @@ echo "output dir is output\windows"
 .\script\sd.exe %title% %init_title% src-tauri\tauri.conf.json
 .\script\sd.exe %name% %init_name% src-tauri\tauri.conf.json
 .\script\sd.exe %name% %init_name% src-tauri\tauri.windows.conf.json
+<<<<<<< Updated upstream
+=======
+pause
+>>>>>>> Stashed changes
